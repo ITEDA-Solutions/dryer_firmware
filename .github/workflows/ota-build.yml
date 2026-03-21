@@ -1,0 +1,34 @@
+name: Build & Deploy OTA
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Compile Firmware
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32wrover ItedaFirmware.ino
+          mkdir -p ota
+          cp $(arduino-cli compile --fqbn esp32:esp32:lolin32-lite --show-binary ItedaFirmware.ino) ota/ItedaFirmware.bin
+
+      - name: Generate OTA Manifest
+        run: |
+          echo '{
+            "version": "v1.0.${{ github.run_number }}",
+            "bin_url": "https://bujo-eayn.github.io/dryer_firmware/ota/ItedaFirmware.bin"
+          }' > ota/manifest.json
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./ota
