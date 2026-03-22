@@ -62,6 +62,31 @@ const unsigned long UPLOAD_INTERVAL = 5000;
 const unsigned long WIFI_INTERVAL = 10000;
 
 // ==========================================================
+// STRUCT
+// ==========================================================
+struct SensorData
+{
+  String timestamp;
+  float chamber_temp;
+  float ambient_temp;
+  float heater_temp;
+  float internal_humidity;
+  float external_humidity;
+
+  int fan_speed_rpm;
+  bool fan_status;
+  bool heater_status;
+  bool door_status;
+
+  float solar_voltage;
+  int battery_level;
+  float battery_voltage;
+
+  float power_consumption_w;
+  String charging_status;
+};
+
+// ==========================================================
 // Check for OTA
 // ==========================================================
 bool checkForOTA() {
@@ -103,30 +128,6 @@ bool checkForOTA() {
   http.end();
   return true;
 }
-
-// ==========================================================
-// STRUCT
-// ==========================================================
-struct SensorData {
-  String timestamp;
-  float chamber_temp;
-  float ambient_temp;
-  float heater_temp;
-  float internal_humidity;
-  float external_humidity;
-
-  int fan_speed_rpm;
-  bool fan_status;
-  bool heater_status;
-  bool door_status;
-
-  float solar_voltage;
-  int battery_level;
-  float battery_voltage;
-
-  float power_consumption_w;
-  String charging_status;
-};
 
 // ==========================================================
 // TIME
