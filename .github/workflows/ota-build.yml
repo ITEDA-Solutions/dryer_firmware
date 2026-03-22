@@ -25,7 +25,7 @@ jobs:
         run: |
           arduino-cli lib install "DHT sensor library"
           arduino-cli lib install "Adafruit Unified Sensor"
-          arduino-cli lib install "ArduinoJson"
+          arduino-cli lib install "ArduinoJson@6.21.5"
 
       - name: Compile Firmware
         run: |
