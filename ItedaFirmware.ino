@@ -7,8 +7,8 @@
 #include <SPIFFS.h>
 #include <esp_task_wdt.h>
 #include <time.h>
-#include <WebServer.h>
 #include <ArduinoJson.h>
+#include <HTTPUpdate.h>
 
 // -------------------- SERVER --------------------
 WebServer server(80);
@@ -56,16 +56,17 @@ float power = 0;
 unsigned long lastSensorRead = 0;
 unsigned long lastUpload = 0;
 unsigned long lastWiFiCheck = 0;
+unsigned long lastOTACheck = 0;
 
 const unsigned long SENSOR_INTERVAL = 2000;
 const unsigned long UPLOAD_INTERVAL = 5000;
 const unsigned long WIFI_INTERVAL = 10000;
+const unsigned long OTA_INTERVAL = 60000;
 
 // ==========================================================
 // STRUCT
 // ==========================================================
-struct SensorData
-{
+struct SensorData {
   String timestamp;
   float chamber_temp;
   float ambient_temp;
@@ -73,7 +74,6 @@ struct SensorData
   float internal_humidity;
   float external_humidity;
 
-  int fan_speed_rpm;
   bool fan_status;
   bool heater_status;
   bool door_status;
@@ -87,29 +87,28 @@ struct SensorData
 };
 
 // ==========================================================
-// Check for OTA
+// OTA
 // ==========================================================
 bool checkForOTA() {
   WiFiClientSecure client;
   client.setInsecure();
-  
+
   HTTPClient http;
-  http.begin(client, "https://bujo-eayn.github.io/ItedaFirmware/manifest.json"); // Your GitHub Pages URL
+  http.begin(client, "https://bujo-eayn.github.io/ItedaFirmware/manifest.json");
+
   int code = http.GET();
-  
+
   if (code != 200) {
     Serial.println("[OTA] Failed to fetch manifest");
     http.end();
     return false;
   }
-  
+
   String payload = http.getString();
-  Serial.println("[OTA] Manifest received: " + payload);
 
   DynamicJsonDocument doc(1024);
-  DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    Serial.println("[OTA] Failed to parse manifest");
+  if (deserializeJson(doc, payload)) {
+    Serial.println("[OTA] JSON parse error");
     http.end();
     return false;
   }
@@ -118,11 +117,27 @@ bool checkForOTA() {
   const char* bin_url = doc["bin_url"];
 
   if (String(latest_version) != FIRMWARE_VERSION) {
-    Serial.printf("[OTA] New firmware found: %s -> %s\n", FIRMWARE_VERSION, latest_version);
-    // Trigger OTA download here using ESP32 HTTP Update library
-    // ESPhttpUpdate.update(bin_url);
+    Serial.println("[OTA] Updating firmware...");
+
+    t_httpUpdate_return ret = httpUpdate.update(client, bin_url);
+
+    switch (ret) {
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("[OTA] Failed (%d): %s\n",
+          httpUpdate.getLastError(),
+          httpUpdate.getLastErrorString().c_str());
+        break;
+
+      case HTTP_UPDATE_NO_UPDATES:
+        Serial.println("[OTA] No updates");
+        break;
+
+      case HTTP_UPDATE_OK:
+        Serial.println("[OTA] Update OK");
+        break;
+    }
   } else {
-    Serial.println("[OTA] Firmware up-to-date");
+    Serial.println("[OTA] Up-to-date");
   }
 
   http.end();
@@ -136,9 +151,7 @@ String getTimestamp() {
   time_t now;
   time(&now);
 
-  // If time is not synced, return a safe fallback
-  if (now < 1600000000) { // roughly 2020
-    Serial.println("[TIME] NTP not synced, using fallback timestamp");
+  if (now < 1600000000) {
     return "2026-01-01T00:00:00Z";
   }
 
@@ -152,83 +165,48 @@ String getTimestamp() {
 // STORAGE
 // ==========================================================
 void saveToQueue(String json) {
-  Serial.println("[QUEUE] Saving data locally");
   File file = SPIFFS.open("/queue.txt", FILE_APPEND);
-  if (!file) {
-    Serial.println("[ERROR] Failed to open queue file");
-    return;
-  }
+  if (!file) return;
   file.println(json);
   file.close();
 }
 
 bool sendToServer(String payload) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[API] WiFi not connected, skipping send");
-    return false;
-  }
-
-  Serial.println("[API] Sending payload:");
-  Serial.println(payload);
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClientSecure client;
   client.setInsecure();
 
   HTTPClient https;
-
-  if (!https.begin(client, API_URL)) {
-    Serial.println("[ERROR] HTTPS begin failed");
-    return false;
-  }
+  if (!https.begin(client, API_URL)) return false;
 
   https.addHeader("Content-Type", "application/json");
   https.addHeader("Authorization", "Bearer " + String(AUTH_TOKEN));
 
   int code = https.POST(payload);
-
-  Serial.print("[API] Response code: ");
-  Serial.println(code);
-
   String response = https.getString();
-  Serial.println("[API] Response:");
-  Serial.println(response);
 
-  // Remote control parsing
   if (code > 0) {
-    if (response.indexOf("\"mode\":\"manual\"") != -1) {
-      autoMode = false;
-      Serial.println("[CONTROL] Switched to MANUAL mode");
-    }
-    if (response.indexOf("\"mode\":\"auto\"") != -1) {
-      autoMode = true;
-      Serial.println("[CONTROL] Switched to AUTO mode");
-    }
+    if (response.indexOf("\"mode\":\"manual\"") != -1) autoMode = false;
+    if (response.indexOf("\"mode\":\"auto\"") != -1) autoMode = true;
 
     if (!autoMode) {
       heaterState = (response.indexOf("\"heater\":1") != -1);
       fanState = (response.indexOf("\"fan\":1") != -1);
-      Serial.printf("[CONTROL] Remote -> Heater:%d Fan:%d\n", heaterState, fanState);
     }
   }
 
   https.end();
-
   return (code > 0 && code < 300);
 }
 
 void flushQueue() {
-  Serial.println("[QUEUE] Attempting to flush stored data");
-
   File file = SPIFFS.open("/queue.txt", FILE_READ);
-  if (!file) {
-    Serial.println("[QUEUE] No stored data");
-    return;
-  }
+  if (!file) return;
 
   while (file.available()) {
     String line = file.readStringUntil('\n');
     if (!sendToServer(line)) {
-      Serial.println("[QUEUE] Failed to send queued data");
       file.close();
       return;
     }
@@ -236,11 +214,10 @@ void flushQueue() {
 
   file.close();
   SPIFFS.remove("/queue.txt");
-  Serial.println("[QUEUE] Successfully flushed queue");
 }
 
 // ==========================================================
-// CONTROL LOGIC
+// CONTROL
 // ==========================================================
 void runControlLogic(float chamberTemp) {
   if (autoMode) {
@@ -249,11 +226,8 @@ void runControlLogic(float chamberTemp) {
     fanState = 1;
   }
 
-  digitalWrite(HEATER_RELAY, heaterState ? HIGH : LOW);
-  digitalWrite(FAN_RELAY, fanState ? HIGH : LOW);
-
-  Serial.printf("[CONTROL] Heater:%d Fan:%d Mode:%s\n",
-                heaterState, fanState, autoMode ? "AUTO" : "MANUAL");
+  digitalWrite(HEATER_RELAY, heaterState);
+  digitalWrite(FAN_RELAY, fanState);
 }
 
 // ==========================================================
@@ -261,14 +235,13 @@ void runControlLogic(float chamberTemp) {
 // ==========================================================
 void ensureWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WIFI] Reconnecting...");
     WiFi.disconnect();
     WiFi.begin(ssid, password);
   }
 }
 
 // ==========================================================
-// BUILD PAYLOAD
+// PAYLOAD
 // ==========================================================
 String buildPayload(SensorData d) {
   String json = "{";
@@ -276,22 +249,19 @@ String buildPayload(SensorData d) {
   json += "\"dryer_id\":\"REAL_DRYER\",";
   json += "\"timestamp\":\"" + d.timestamp + "\",";
 
-  // Use safe defaults if sensor failed
   json += "\"chamber_temp\":" + String(d.chamber_temp) + ",";
   json += "\"ambient_temp\":" + String(d.ambient_temp) + ",";
   json += "\"heater_temp\":" + String(d.heater_temp) + ",";
   json += "\"internal_humidity\":" + String(d.internal_humidity) + ",";
   json += "\"external_humidity\":" + String(d.external_humidity) + ",";
 
-  json += "\"fan_speed_rpm\":0,";
   json += "\"fan_status\":" + String(d.fan_status ? "true" : "false") + ",";
   json += "\"heater_status\":" + String(d.heater_status ? "true" : "false") + ",";
   json += "\"door_status\":" + String(d.door_status ? "true" : "false") + ",";
 
-  // Safe fallback values
-  json += "\"solar_voltage\":" + String(d.solar_voltage >= 0 ? d.solar_voltage : 12.0) + ",";
-  json += "\"battery_level\":" + String(d.battery_level > 0 ? d.battery_level : 50) + ",";
-  json += "\"battery_voltage\":" + String(d.battery_voltage >= 8 ? d.battery_voltage : 12.0) + ",";
+  json += "\"solar_voltage\":" + String(d.solar_voltage) + ",";
+  json += "\"battery_level\":" + String(d.battery_level) + ",";
+  json += "\"battery_voltage\":" + String(d.battery_voltage) + ",";
 
   json += "\"power_consumption_w\":" + String(d.power_consumption_w) + ",";
   json += "\"charging_status\":\"" + d.charging_status + "\"";
@@ -305,9 +275,6 @@ String buildPayload(SensorData d) {
 // ==========================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
-  Serial.println("\n=== SYSTEM START ===");
 
   pinMode(HEATER_RELAY, OUTPUT);
   pinMode(FAN_RELAY, OUTPUT);
@@ -316,53 +283,21 @@ void setup() {
   dht1.begin();
   dht2.begin();
 
-  if (!SPIFFS.begin(true)) {
-    Serial.println("[ERROR] SPIFFS failed");
-  } else {
-    Serial.println("[OK] SPIFFS mounted");
-  }
+  SPIFFS.begin(true);
 
-  Serial.print("[WIFI] Connecting");
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+  while (WiFi.status() != WL_CONNECTED) delay(500);
 
-  Serial.println("\n[WIFI] Connected!");
-  Serial.print("[WIFI] IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.println("[TIME] Syncing time...");
   configTime(0, 0, "pool.ntp.org");
-  delay(2000);
 
-  ArduinoOTA.onStart([]() { Serial.println("[OTA] Start"); });
-  ArduinoOTA.onEnd([]() { Serial.println("[OTA] End"); });
   ArduinoOTA.begin();
 
-  // ----- WebServer for logging -----
-  server.on("/logs", [&server]() {
-      String html = "<html><body><pre>";
-      html += "Heater state: " + String(heaterState) + "\n";
-      html += "Fan state: " + String(fanState) + "\n";
-      html += "Auto mode: " + String(autoMode ? "AUTO" : "MANUAL") + "\n";
-      html += "Chamber Temp: " + String(dht1.readTemperature()) + "\n";
-      html += "Ambient Temp: " + String(dht2.readTemperature()) + "\n";
-      html += "Chamber Humidity: " + String(dht1.readHumidity()) + "\n";
-      html += "Ambient Humidity: " + String(dht2.readHumidity()) + "\n";
-      html += "Current (A): " + String(current) + "\n";
-      html += "Power (W): " + String(power) + "\n";
-      html += "</pre></body></html>";
-      server.send(200, "text/html", html);
+  server.on("/logs", []() {
+    server.send(200, "text/plain", "System OK");
   });
-
   server.begin();
-  Serial.println("[SERVER] Web server started");
 
   esp_task_wdt_add(NULL);
-
-  Serial.println("=== SETUP COMPLETE ===");
 }
 
 // ==========================================================
@@ -370,43 +305,37 @@ void setup() {
 // ==========================================================
 void loop() {
   ArduinoOTA.handle();
+  server.handleClient();
   esp_task_wdt_reset();
-
-  server.handleClient(); // <--- Add this for network logging
 
   unsigned long now = millis();
 
-  // WIFI CHECK
   if (now - lastWiFiCheck > WIFI_INTERVAL) {
     lastWiFiCheck = now;
     ensureWiFi();
   }
 
-  // SENSOR READ
+  if (now - lastOTACheck > OTA_INTERVAL) {
+    lastOTACheck = now;
+    checkForOTA();
+  }
+
   if (now - lastSensorRead > SENSOR_INTERVAL) {
     lastSensorRead = now;
-
-    Serial.println("\n[LOOP] Reading sensors...");
 
     float t1 = dht1.readTemperature();
     float h1 = dht1.readHumidity();
     float t2 = dht2.readTemperature();
     float h2 = dht2.readHumidity();
 
-    // Handle failed reads gracefully
-    if (isnan(t1)) t1 = -1.0;
-    if (isnan(h1)) h1 = -1.0;
-    if (isnan(t2)) t2 = -1.0;
-    if (isnan(h2)) h2 = -1.0;
-
-    Serial.printf("[SENSORS] T1: %.2f H1: %.2f | T2: %.2f H2: %.2f\n", t1, h1, t2, h2);
+    if (isnan(t1)) t1 = -1;
+    if (isnan(h1)) h1 = -1;
+    if (isnan(t2)) t2 = -1;
+    if (isnan(h2)) h2 = -1;
 
     int adc = analogRead(CURRENT_PIN);
-    float vout = adc * (3.3 / 4095.0);
-    current = vout;
+    current = adc * (3.3 / 4095.0);
     power = voltage * current;
-
-    Serial.printf("[POWER] Current: %.3f A | Power: %.2f W\n", current, power);
 
     SensorData d;
     d.timestamp = getTimestamp();
@@ -423,7 +352,6 @@ void loop() {
     d.power_consumption_w = power;
     d.charging_status = "unknown";
 
-    // Defaults in case data missing
     d.solar_voltage = 12.0;
     d.battery_level = 50;
     d.battery_voltage = 12;
@@ -437,7 +365,6 @@ void loop() {
     }
   }
 
-  // RETRY QUEUE
   if (now - lastUpload > UPLOAD_INTERVAL) {
     lastUpload = now;
     flushQueue();
